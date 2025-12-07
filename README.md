@@ -1,9 +1,9 @@
 
 
 ### 准备工作
-| 需求组件 | 说明 | 下载地址 |
+| 需求运行时 | 说明 | 下载地址 |
 | :--- | :--- | :--- |
-| **.NET 10 Runtime** | 必须安装此环境才能运行 | [点击下载](https://dotnet.microsoft.com/zh-cn/download/dotnet/10.0) |
+| **.NET 10** | 非自包含版本依赖 | [点击下载](https://dotnet.microsoft.com/zh-cn/download/dotnet/10.0) |
 
 ### 操作指引
 **按钮布局（由上至下）：**
