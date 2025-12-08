@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Media;
+using System.IO; // 需要引用 IO
 
 using OpenFileDialog = Microsoft.Win32.OpenFileDialog;
 using WinBitmap = System.Drawing.Bitmap;
@@ -20,7 +21,7 @@ namespace DGPrinter
     {
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
-        // 用于移开鼠标防止遮挡
+        // 用于移开鼠标
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool SetCursorPos(int x, int y);
@@ -51,6 +52,39 @@ namespace DGPrinter
             {
                 _sourceImagePath = dlg.FileName;
                 BtnImage.Content = System.IO.Path.GetFileName(_sourceImagePath);
+                // 重置一下截图按钮的状态文本，避免混淆
+                BtnSnapshot.Content = "Snapshot from Screen";
+            }
+        }
+
+        // --- 新增：截图作为源图像 ---
+        private async void BtnSnapshot_Click(object sender, RoutedEventArgs e)
+        {
+            // 1. 选择截图区域
+            Rect shotRect = await PickRegion();
+            if (shotRect.IsEmpty) return;
+
+            try
+            {
+                // 2. 截取屏幕
+                using (var bmp = new WinBitmap((int)shotRect.Width, (int)shotRect.Height))
+                using (var g = WinGraphics.FromImage(bmp))
+                {
+                    g.CopyFromScreen((int)shotRect.X, (int)shotRect.Y, 0, 0, bmp.Size);
+
+                    // 3. 保存到临时文件
+                    string tempPath = Path.Combine(Path.GetTempPath(), "dgprinter_snapshot.png");
+                    bmp.Save(tempPath, System.Drawing.Imaging.ImageFormat.Png);
+
+                    // 4. 设置为源图像
+                    _sourceImagePath = tempPath;
+                    BtnImage.Content = "Use Snapshot"; // 更新文件按钮文字
+                    BtnSnapshot.Content = "Snapshot Captured!";
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Windows.MessageBox.Show("Failed to capture screen: " + ex.Message);
             }
         }
 
@@ -89,10 +123,25 @@ namespace DGPrinter
         {
             if (_isRunning) return;
 
+            // --- 修改：校验逻辑 ---
+            int mode = ComboMode.SelectedIndex;
+            bool isColorMode = (mode != 0); // 模式0是黑白，其他是彩色
+
+            // 基础检查
             if (_pen == null || string.IsNullOrEmpty(_sourceImagePath) || _canvasRect.IsEmpty)
             {
-                System.Windows.MessageBox.Show("Please check initialization.");
+                System.Windows.MessageBox.Show("Please select an Image (or Snapshot) and set Canvas Area.");
                 return;
+            }
+
+            // 只有在彩色模式下，才检查取色器区域
+            if (isColorMode)
+            {
+                if (_btnRect.IsEmpty || _pickerRect.IsEmpty)
+                {
+                    System.Windows.MessageBox.Show("For Color Mode, you must set 'Color Button Area' and 'Picker Region'.");
+                    return;
+                }
             }
 
             _isRunning = true;
@@ -103,7 +152,6 @@ namespace DGPrinter
             BtnCancel.Visibility = Visibility.Visible;
             TxtPrediction.Text = "Calculating...";
 
-            int mode = ComboMode.SelectedIndex;
             string path = _sourceImagePath;
 
             StartHotkeyListener(_cts.Token);
@@ -161,15 +209,14 @@ namespace DGPrinter
                 var paths = ImageProcessor.GetBinaryPaths(imgPath, _canvasRect.Width, _canvasRect.Height);
                 allBatches.Add((null, paths));
             }
-            else if (mode == 1) // Mode 2: Raster Colored Edges (短横线边缘)
+            else if (mode == 1) // Raster Colored Edges
             {
-                // 使用新的光栅化边缘算法
                 var edges = ImageProcessor.GetRasterColoredEdges(imgPath, _canvasRect.Width, _canvasRect.Height);
                 var groups = edges.GroupBy(x => x.Color).ToList();
                 foreach (var g in groups)
                     allBatches.Add((g.Key, g.Select(x => x.Path).ToList()));
             }
-            else // Mode 3: 256 Colors (Quantized)
+            else // 256 Colors
             {
                 var blocks = ImageProcessor.GetQuantized256Blocks(imgPath, _canvasRect.Width, _canvasRect.Height);
                 var groups = blocks.GroupBy(x => x.Color).ToList();
@@ -194,17 +241,20 @@ namespace DGPrinter
                 }
             }
 
+            // 黑白模式没有换色耗时
             double estimatedSeconds = (totalColorChanges * 2.5) + (totalPixels / 400.0);
 
             Dispatcher.Invoke(() =>
             {
-                TxtPrediction.Text = $"~ {estimatedSeconds / 60.0:F1} Min ({totalColorChanges} Colors)";
+                string info = mode == 0 ? "B&W Mode" : $"{totalColorChanges} Colors";
+                TxtPrediction.Text = $"~ {estimatedSeconds / 60.0:F1} Min ({info})";
             });
 
             // 执行绘制
             foreach (var batch in allBatches)
             {
-                if (batch.Color.HasValue)
+                // 只有当有颜色且不是黑白模式时，才执行取色
+                if (batch.Color.HasValue && mode != 0)
                 {
                     PickColor(batch.Color.Value, token);
                 }
@@ -225,7 +275,6 @@ namespace DGPrinter
             }
         }
 
-        // --- 修复取色逻辑 ---
         private void PickColor(WinColor target, CancellationToken token)
         {
             if (_btnRect.IsEmpty || _pickerRect.IsEmpty || _pen == null) return;
@@ -233,14 +282,13 @@ namespace DGPrinter
 
             // 1. 点开颜色面板
             _pen.Click(_btnRect.X + _btnRect.Width / 2, _btnRect.Y + _btnRect.Height / 2);
-            Thread.Sleep(800); // 增加等待时间，防止面板没出来就截图
+            Thread.Sleep(800);
 
             token.ThrowIfCancellationRequested();
 
-            // 2. 关键修复：将鼠标移出 Picker 区域，防止遮挡或高亮
-            // 移到屏幕左上角 (0,0) 是最安全的
+            // 2. 移开鼠标
             SetCursorPos(0, 0);
-            Thread.Sleep(50); // 给系统一点刷新时间
+            Thread.Sleep(50);
 
             WinPoint best = new WinPoint((int)_pickerRect.X, (int)_pickerRect.Y);
             double min = double.MaxValue;
@@ -251,14 +299,11 @@ namespace DGPrinter
             {
                 g.CopyFromScreen((int)_pickerRect.X, (int)_pickerRect.Y, 0, 0, bmp.Size);
 
-                // 扫描所有像素，寻找 RGB 距离最近的
-                // 步长 4，兼顾速度和精度
                 for (int y = 0; y < bmp.Height; y += 4)
                 {
                     for (int x = 0; x < bmp.Width; x += 4)
                     {
                         var px = bmp.GetPixel(x, y);
-                        // 欧氏距离平方
                         double dist = Math.Pow(px.R - target.R, 2) + Math.Pow(px.G - target.G, 2) + Math.Pow(px.B - target.B, 2);
                         if (dist < min)
                         {
@@ -269,11 +314,10 @@ namespace DGPrinter
                 }
             }
 
-            // 4. 点击选中的颜色
             _pen.Click(best.X, best.Y);
             Thread.Sleep(150);
 
-            // 5. 点击关闭
+            // 4. 点击关闭
             if (!_closePickerRect.IsEmpty)
             {
                 token.ThrowIfCancellationRequested();
@@ -281,8 +325,6 @@ namespace DGPrinter
                 Thread.Sleep(500);
             }
         }
-
-        private WinColor Quantize(WinColor c) => WinColor.FromArgb(c.R / 20 * 20, c.G / 20 * 20, c.B / 20 * 20);
         #endregion
     }
 }
